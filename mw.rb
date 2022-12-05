@@ -1,5 +1,7 @@
 ﻿$gen = Random.new
 
+ARMOR_RESISTANCE = 0.735
+
 # RESONANT_FISTS = 'Resonant Fists'
 SUMMON_WHITE_TIGER_STATUE = 'Summon White Tiger Statue'
 TEACHINGS = 'Teachings'
@@ -13,7 +15,8 @@ TEA_OF_PLENTY = 'Tea of Plenty'
 FOCUSED_THUNDER = 'Focused Thunder'
 
 class State
-  attr_reader :talents, :base_versatility, :base_haste, :time
+  attr_reader :talents, :base_versatility, :base_haste,
+              :time, :history, :damage, :total_weapon_damage, :total_white_tiger_damage
   attr_accessor :cooldowns, :buffs, :teachings, :first_tft_empower_available, :empowered_rsks
 
   def initialize(talents)
@@ -23,12 +26,40 @@ class State
     @talents = Hash.new(false).merge(talents)
 
     @time = 0
+    @history = []
+    @damage = 0
+    @total_weapon_damage = 0
+    @total_white_tiger_damage = 0
+
     @cooldowns = Hash.new(0)
     @buffs = Hash.new(0)
     @faeline = false
     @teachings = 0
     @empowered_rsks = 0
     @first_tft_empower_available = false
+  end
+
+  def cast_ability(ability, num_targets)
+    throw "Cannot cast ability on cooldown" if on_cd?(ability.name)
+
+    cooldowns[ability.name] = ability.hasted_cooldown(self)
+
+    damage = ability.cast(self, num_targets).round
+    ability.side_effects(self, num_targets)
+
+    gcd = ability.gcd / (1 + haste)
+
+    weapon_damage = weapon_dps * gcd * damage_multiplier
+    white_tiger_damage = white_tiger_dps(num_targets) * gcd * damage_multiplier
+
+    @total_weapon_damage += weapon_damage
+    @total_white_tiger_damage += white_tiger_damage
+    @damage += damage + weapon_damage + white_tiger_damage
+    @history << [ability.name, damage]
+
+    @cooldowns.transform_values! { _1 - gcd }
+    @buffs.transform_values! { _1 - gcd }
+    @time += gcd
   end
 
   def attack_power
@@ -40,7 +71,7 @@ class State
   end
 
   def weapon_dps
-    1447.79
+    1582.24
   end
 
   def versatility
@@ -72,12 +103,20 @@ class State
     !buff_active?(buff_name)
   end
 
-  def tick_gcd(ability_gcd)
-    gcd = ability_gcd / (1 + haste)
-    @time += gcd
-    @cooldowns.transform_values! { _1 - gcd }
-    @buffs.transform_values! { _1 - gcd }
-    gcd
+  def damage_multiplier
+    vers_multiplier = 1 + versatility
+    crit_multipler = 1 + critical_strike
+    xuen_multiplier = talents['Ferocity of Xuen'] ? 1.04 : 1
+    bdb_multiplier = buff_active?(BONEDUST_BREW) ? 1.25 : 1
+    bdb_multiplier *= 1.2 if talents[ATTENUATION] && buff_active?(BONEDUST_BREW)
+    vers_multiplier * crit_multipler * xuen_multiplier * bdb_multiplier
+  end
+
+  def white_tiger_dps(num_targets)
+    return 0 unless buff_active?(SUMMON_WHITE_TIGER_STATUE)
+    attack_power_scaling = 0.25
+    time_between_pulses = 2
+    attack_power_scaling * attack_power * num_targets / time_between_pulses
   end
 
   def secret_infusion_increase
@@ -107,13 +146,8 @@ class Ability
     base_damage = @ap_scaling * state.attack_power + @sp_scaling * state.spell_power
     base_damage += base_damage * @mw_modifier
     targets_hit = [num_targets, @max_targets].min
-    armor_reduction = @physical_school ? 0.735 : 1
-    vers_multiplier = 1 + state.versatility
-    crit_multipler = 1 + state.critical_strike
-    xuen_multiplier = state.talents['Ferocity of Xuen'] ? 1.04 : 1
-    bdb_multiplier = state.buff_active?(BONEDUST_BREW) ? 1.25 : 1
-    bdb_multiplier *= 1.2 if state.talents[ATTENUATION] && state.buff_active?(BONEDUST_BREW)
-    base_damage * targets_hit * armor_reduction * vers_multiplier * crit_multipler * xuen_multiplier * bdb_multiplier
+    armor_reduction = @physical_school ? ARMOR_RESISTANCE : 1
+    base_damage * targets_hit * armor_reduction * state.damage_multiplier
   end
 
   def side_effects(state, num_targets) end
@@ -202,7 +236,9 @@ class BonedustBrew < Ability
 end
 
 class SummonWhiteTigerStatue < Ability
-  def side_effects(state, num_targets) end
+  def side_effects(state, num_targets)
+    state.buffs[SUMMON_WHITE_TIGER_STATUE] = 30
+  end
 end
 
 class ThunderFocusTea < Ability
@@ -219,8 +255,6 @@ class ThunderFocusTea < Ability
 end
 
 class Iteration
-  attr_reader :damage, :history
-
   def initialize(talents)
     @state = State.new(talents)
     @damage = 0
@@ -237,38 +271,28 @@ class Iteration
           (condition.nil? || condition.call(@state))
       end
       ability = ability.first if ability.is_a?(Array)
-      throw "Chose ability on cooldown" if @state.on_cd?(ability.name)
-
-      @state.cooldowns[ability.name] = ability.hasted_cooldown(@state)
-
-      damage = ability.cast(@state, num_targets).round
-      ability.side_effects(@state, num_targets)
-
-      @damage += damage
-      @history << [ability.name, damage]
-
-      gcd = @state.tick_gcd(ability.gcd)
-
-      weapon_damage = @state.weapon_dps * gcd
-      @total_weapon_damage += weapon_damage
-      @damage += weapon_damage
+      @state.cast_ability(ability, num_targets)
     end
   end
 
+  def damage
+    @state.damage
+  end
+
   def dps
-    (@damage / @state.time).round
+    (@state.damage / @state.time).round
   end
 
   def print_stats
-    puts "Damage: #{damage.round}"
-    puts "DPS: #{dps}"
+    puts "Damage: #{@state.damage.round}"
+    puts "DPS: #{@state.dps}"
     puts "Weapon: #{(@total_weapon_damage / @state.time).round} dps"
-    @history.group_by { _1[0] }.each do |ability_name, casts|
+    @state.history.group_by { _1[0] }.each do |ability_name, casts|
       ability_dps = (casts.sum { _2 || 0 } / @state.time).round
       puts "#{ability_name}: #{ability_dps} dps, #{casts.size} casts" if ability_dps > 0
     end
     puts
-    @history.each do |h|
+    @state.history.each do |h|
       puts h.join(' - ')
     end
   end
@@ -317,12 +341,13 @@ zen_pulse = Ability.new(name: 'Zen Pulse', sp_scaling: 1.37816, cooldown: 30, ma
 chi_burst = Ability.new(name: 'Chi Burst', sp_scaling: 0.46, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
 faeline_stomp = FaelineStomp.new(name: FAELINE_STOMP, ap_scaling: 0.4, cooldown: 30, max_targets: 5, physical_school: false)
 bdb = BonedustBrew.new(name: BONEDUST_BREW, cooldown: 60, gcd: 1, required_talent: BONEDUST_BREW)
-summon_white_tiger_statue = SummonWhiteTigerStatue.new(name: SUMMON_WHITE_TIGER_STATUE, ap_scaling: 0.25, cooldown: 120, gcd: 1, required_talent: SUMMON_WHITE_TIGER_STATUE)
+summon_white_tiger_statue = SummonWhiteTigerStatue.new(name: SUMMON_WHITE_TIGER_STATUE, cooldown: 120, gcd: 1, required_talent: SUMMON_WHITE_TIGER_STATUE)
 invoke = Invoke.new(name: 'Invoke', cooldown: 180, gcd: 1, required_talent: INVOKERS_DELIGHT)
 tft = ThunderFocusTea.new(name: 'Thunder Focus Tea', cooldown: 30, gcd: 0)
 
 single_target = Strategy.new('ST', [], [
   tft,
+  summon_white_tiger_statue,
   [faeline_stomp, -> { _1.buff_inactive?(FAELINE_STOMP) }],
   invoke,
   bdb,
@@ -333,6 +358,7 @@ single_target = Strategy.new('ST', [], [
 
 st_infusion_prio = Strategy.new('STI', [], [
   tft,
+  summon_white_tiger_statue,
   [faeline_stomp, -> { _1.buff_inactive?(FAELINE_STOMP) }],
   invoke,
   bdb,
@@ -371,7 +397,7 @@ target_strategies = {
 default_talents = {
   'Ferocity of Xuen' => true,
   'Fast Feet' => true,
-  SUMMON_WHITE_TIGER_STATUE => false,
+  SUMMON_WHITE_TIGER_STATUE => true,
   TEACHINGS => true,
   GIFT_OF_THE_CELESTIALS => true,
   TEA_OF_PLENTY => false,
@@ -395,7 +421,7 @@ talent_combos = talents_to_test.permutation(4).filter_map do |talents|
 end.uniq
 
 s = Time.new
-duration = 30
+duration = 120
 iterations = 100
 total_iter_count = 0
 seed = Random.new_seed
