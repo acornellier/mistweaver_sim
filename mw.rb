@@ -38,9 +38,7 @@ class Stats
       puts damage_stats(ability_name, ability_damage, casts.size) if ability_damage > 0
     end
     puts
-    # @state.cast_history.each do |h|
-    #   puts h.join(' - ')
-    # end
+    @cast_history.each { |name, damage| puts "#{name} -- #{damage.round}" }
   end
 
   def damage_stats(name, damage, casts)
@@ -80,7 +78,8 @@ class State
 
     cooldowns[ability.name] = ability.hasted_cooldown(self)
 
-    damage = ability.damage(self, num_targets).round
+    damage_hits = ability.damage_hits(self, num_targets)
+    damage = damage_hits.sum
     ability.side_effects(self, num_targets)
 
     gcd = ability.gcd / (1 + haste)
@@ -167,12 +166,18 @@ class Ability
     @required_talent = required_talent
   end
 
-  def damage(state, num_targets)
+  def damage_hits(state, num_targets)
+    targets_hit = [num_targets, @max_targets].min
+    damage = base_damage(state, num_targets)
+    return [] if damage == 0
+    [damage] * targets_hit
+  end
+
+  def base_damage(state, num_targets)
     base_damage = @ap_scaling * state.base_attack_power + @sp_scaling * state.base_spell_power
     base_damage += base_damage * @mw_modifier
-    targets_hit = [num_targets, @max_targets].min
     armor_reduction = @physical_school ? ARMOR_RESISTANCE : 1
-    base_damage * targets_hit * armor_reduction * state.damage_multiplier
+    base_damage * armor_reduction * state.damage_multiplier
   end
 
   def side_effects(state, num_targets) end
@@ -184,7 +189,7 @@ class Ability
 end
 
 class TigerPalm < Ability
-  def damage(state, num_targets)
+  def damage_hits(state, num_targets)
     super * (state.buff_active?(FAELINE_STOMP) ? 2 : 1)
   end
 
@@ -196,9 +201,10 @@ class TigerPalm < Ability
 end
 
 class BlackoutKick < Ability
-  def damage(state, num_targets)
-    @max_targets = state.buff_active?(FAELINE_STOMP) ? 3 : 1
-    super * (1 + state.teachings)
+  def damage_hits(state, num_targets)
+    faline_targets = state.buff_active?(FAELINE_STOMP) ? [3, num_targets].min : 1
+    teaching_hits = (1 + state.teachings)
+    super * faline_targets * teaching_hits
   end
 
   def side_effects(state, num_targets)
@@ -216,7 +222,7 @@ class BlackoutKick < Ability
 end
 
 class RisingSunKick < Ability
-  def damage(state, num_targets)
+  def base_damage(state, num_targets)
     fast_feet_multiplier = state.talents['Fast Feet'] ? 1.7 : 1
     super * fast_feet_multiplier
   end
@@ -232,7 +238,11 @@ class RisingSunKick < Ability
 end
 
 class SpinningCraneKick < Ability
-  def damage(state, num_targets)
+  def damage_hits(state, num_targets)
+    super * 4
+  end
+
+  def base_damage(state, num_targets)
     fast_feet_multiplier = state.talents['Fast Feet'] ? 1.1 : 1
     base = super * fast_feet_multiplier
     base *= Math.sqrt(5.0 / num_targets) if num_targets > 5
@@ -324,7 +334,7 @@ Result = Struct.new(:strategy, :best_iteration, :dps)
 tiger_palm = TigerPalm.new(name: 'Tiger Palm', ap_scaling: 0.27027, mw_modifier: 1)
 blackout_kick = BlackoutKick.new(name: 'Blackout Kick', ap_scaling: 0.847, mw_modifier: -0.15, cooldown: 3, haste_flagged: true)
 rsk = RisingSunKick.new(name: 'Rising Sun Kick', ap_scaling: 1.438, mw_modifier: 0.38, cooldown: 12, haste_flagged: true)
-sck = SpinningCraneKick.new(name: 'Spinning Crane Kick', ap_scaling: 0.4, mw_modifier: 1.35, max_targets: Float::INFINITY)
+sck = SpinningCraneKick.new(name: 'Spinning Crane Kick', ap_scaling: 0.1, mw_modifier: 1.35, max_targets: Float::INFINITY)
 zen_pulse = Ability.new(name: 'Zen Pulse', sp_scaling: 1.37816, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
 chi_burst = Ability.new(name: 'Chi Burst', sp_scaling: 0.46, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
 faeline_stomp = FaelineStomp.new(name: FAELINE_STOMP, ap_scaling: 0.4, cooldown: 30, max_targets: 5, physical_school: false)
@@ -414,7 +424,7 @@ iterations = 100
 total_iter_count = 0
 seed = Random.new_seed
 
-(1..1).each do |num_targets|
+(1..5).each do |num_targets|
   puts "#{num_targets} targets"
 
   strategies = target_strategies.fetch(num_targets)
@@ -446,7 +456,7 @@ seed = Random.new_seed
   end
 
   # results.each { |result| puts; puts [result.strategy.name, pretty_talents.call(result)].join(' | '); result.best_iteration.print_stats }
-  puts; results.first.best_iteration.print_stats
+  # puts; results.first.best_iteration.print_stats
   puts
 end
 
