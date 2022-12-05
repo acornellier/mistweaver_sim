@@ -2,7 +2,9 @@
 
 ARMOR_RESISTANCE = 0.735
 
-# RESONANT_FISTS = 'Resonant Fists'
+FEROCITY_OF_XUEN = 'Ferocity of Xuen'
+FAST_FEET = 'Fast Feet'
+RESONANT_FISTS = 'Resonant Fists'
 SUMMON_WHITE_TIGER_STATUE = 'Summon White Tiger Statue'
 TEACHINGS = 'Teachings'
 FAELINE_STOMP = 'Faeline Stomp'
@@ -15,36 +17,51 @@ TEA_OF_PLENTY = 'Tea of Plenty'
 FOCUSED_THUNDER = 'Focused Thunder'
 
 class Stats
-  attr_accessor :time, :cast_history, :damage, :total_weapon_damage, :total_white_tiger_damage
+  Hit = Struct.new(:name, :damage)
+
+  attr_accessor :time
 
   def initialize
     @time = 0
+    @hit_history = []
     @cast_history = []
-    @damage = 0
-    @total_weapon_damage = 0
-    @total_white_tiger_damage = 0
+  end
+
+  def add_to_history(name, damage_hits, is_ability: false)
+    damage_hits.each do |damage|
+      @hit_history << Hit.new(name, damage)
+    end
+
+    @cast_history << [name, damage_hits.sum] if is_ability
+  end
+
+  def damage
+    @hit_history.sum(&:damage)
   end
 
   def dps
-    (@damage / @time).round
+    (damage / @time).round
   end
 
-  def print_stats
-    puts "Damage: #{@damage.round}"
-    puts "DPS: #{dps}"
-    puts damage_stats('Weapon', @total_weapon_damage.round, '?')
-    @cast_history.group_by { _1[0] }.each do |ability_name, casts|
-      ability_damage = casts.sum { _2 || 0 }.round
-      puts damage_stats(ability_name, ability_damage, casts.size) if ability_damage > 0
+  def print_stats(print_casts = false)
+    puts "DPS: #{dps} (#{damage.round} dmg)"
+
+    grouped_casts = @cast_history.group_by { _1[0] }
+    @hit_history.group_by(&:name).sort_by do |_name, hits|
+      hits.map(&:damage).sum.round / damage
+    end.reverse.each do |name, hits|
+      damage = hits.map(&:damage).sum.round
+      casts = grouped_casts[name]&.size || 0
+      puts damage_stats(name, damage, casts, hits.size) if damage > 0
     end
-    puts
-    @cast_history.each { |name, damage| puts "#{name} -- #{damage.round}" }
+
+    puts; @cast_history.each { |name, damage| puts "#{name} -- #{damage.round}" } if print_casts
   end
 
-  def damage_stats(name, damage, casts)
-    ability_percent = (damage / @damage * 100).round(1)
+  def damage_stats(name, damage, casts, hits)
+    ability_percent = (damage / self.damage * 100).round(1)
     ability_dps = (damage / @time).round
-    "#{name}: #{ability_dps} dps (#{ability_percent}%), #{damage} dmg, #{casts} casts"
+    "#{name}: #{ability_dps} dps (#{ability_percent}%), #{damage} dmg, #{casts} casts, #{hits} hits"
   end
 end
 
@@ -54,12 +71,12 @@ class State
   attr_accessor :cooldowns, :buffs, :teachings, :first_tft_empower_available, :empowered_rsks
 
   def initialize(talents)
-    @base_versatility = 0.0998
-    @base_haste = 0.1182
+    @base_versatility = 0.1000
+    @base_haste = 0.1202
     @base_critical_strike = 0.1508
-    @base_attack_power = 6764
-    @base_spell_power = 6504
-    @base_weapon_dps = 1582.24
+    @base_attack_power = 6924
+    @base_spell_power = 6658
+    @base_weapon_dps = 1593.47
     @talents = Hash.new(false).merge(talents)
 
     @time = 0
@@ -78,20 +95,31 @@ class State
 
     cooldowns[ability.name] = ability.hasted_cooldown(self)
 
-    damage_hits = ability.damage_hits(self, num_targets)
-    damage = damage_hits.sum
+    ability_hits = ability.damage_hits(self, num_targets)
     ability.side_effects(self, num_targets)
-
     gcd = ability.gcd / (1 + haste)
 
-    weapon_damage = @base_weapon_dps * gcd * damage_multiplier
-    white_tiger_damage = white_tiger_dps(num_targets) * gcd * damage_multiplier
+    # TODO: weapons dont hit every gcd
+    weapon_hits = [@base_weapon_dps * gcd * damage_multiplier]
 
-    @stats.total_weapon_damage += weapon_damage
-    @stats.total_white_tiger_damage += white_tiger_damage
-    @stats.damage += damage + weapon_damage + white_tiger_damage
-    @stats.cast_history << [ability.name, damage]
+    white_tiger_hits = [white_tiger_dps(num_targets) * gcd * damage_multiplier]
 
+    bdb_procers = ability_hits + weapon_hits + white_tiger_hits
+    bdb_hits = bonedust_brew_damage_hits(bdb_procers)
+
+    resonant_fists_procers = ability_hits + weapon_hits
+    resonant_fists_hits = resonant_fists_hits(resonant_fists_procers, num_targets)
+
+    @stats.add_to_history(ability.name, ability_hits, is_ability: true)
+    @stats.add_to_history('Weapon', weapon_hits)
+    @stats.add_to_history('White Tiger Statue', white_tiger_hits)
+    @stats.add_to_history(RESONANT_FISTS, resonant_fists_hits)
+    @stats.add_to_history(BONEDUST_BREW, bdb_hits)
+
+    tick_gcd(gcd)
+  end
+
+  def tick_gcd(gcd)
     @cooldowns.transform_values! { _1 - gcd }
     @buffs.transform_values! { _1 - gcd }
     @time += gcd
@@ -99,7 +127,7 @@ class State
   end
 
   def versatility
-    @base_versatility + secret_infusion_increase
+    @base_versatility + secret_infusion_vers_increase
   end
 
   def haste
@@ -130,10 +158,13 @@ class State
   def damage_multiplier
     vers_multiplier = 1 + versatility
     crit_multipler = 1 + critical_strike
-    xuen_multiplier = talents['Ferocity of Xuen'] ? 1.04 : 1
-    bdb_multiplier = buff_active?(BONEDUST_BREW) ? 1.25 : 1
-    bdb_multiplier *= 1.2 if talents[ATTENUATION] && buff_active?(BONEDUST_BREW)
-    vers_multiplier * crit_multipler * xuen_multiplier * bdb_multiplier
+    xuen_multiplier = talents[FEROCITY_OF_XUEN] ? 1.04 : 1
+    vers_multiplier * crit_multipler * xuen_multiplier
+  end
+
+  def secret_infusion_vers_increase
+    return 0 unless buff_active?(SECRET_INFUSION)
+    { 1 => 0.08, 2 => 0.15 }.fetch(talents[SECRET_INFUSION])
   end
 
   def white_tiger_dps(num_targets)
@@ -143,9 +174,23 @@ class State
     attack_power_scaling * @base_attack_power * num_targets / time_between_pulses
   end
 
-  def secret_infusion_increase
-    return 0 unless buff_active?(SECRET_INFUSION)
-    { 1 => 0.08, 2 => 0.15 }.fetch(talents[SECRET_INFUSION])
+  def resonant_fists_hits(procers, num_targets)
+    return [] unless talents[RESONANT_FISTS]
+    attack_power_scaling = 0.15
+    damage = attack_power_scaling * @base_attack_power * damage_multiplier
+    proc_chance = 0.1
+    procs = procers.size.times.count { $gen.rand < proc_chance }
+    [damage] * procs * num_targets
+  end
+
+  def bonedust_brew_damage_hits(damage_hits)
+    return [] if buff_inactive?(BONEDUST_BREW) || damage_hits.empty?
+    proc_chance = 0.5
+    bdb_multiplier = 0.5
+    bdb_multiplier *= 1.2 if talents[ATTENUATION]
+    damage_hits.select { $gen.rand < proc_chance }.map { _1 * bdb_multiplier }.tap do
+      _1.size.times { @cooldowns[BONEDUST_BREW] -= 0.5 } if @talents[ATTENUATION]
+    end
   end
 end
 
@@ -223,7 +268,7 @@ end
 
 class RisingSunKick < Ability
   def base_damage(state, num_targets)
-    fast_feet_multiplier = state.talents['Fast Feet'] ? 1.7 : 1
+    fast_feet_multiplier = state.talents[FAST_FEET] ? 1.7 : 1
     super * fast_feet_multiplier
   end
 
@@ -243,7 +288,7 @@ class SpinningCraneKick < Ability
   end
 
   def base_damage(state, num_targets)
-    fast_feet_multiplier = state.talents['Fast Feet'] ? 1.1 : 1
+    fast_feet_multiplier = state.talents[FAST_FEET] ? 1.1 : 1
     base = super * fast_feet_multiplier
     base *= Math.sqrt(5.0 / num_targets) if num_targets > 5
     base
@@ -283,25 +328,26 @@ class ThunderFocusTea < Ability
     state.empowered_rsks += 1 if state.talents[FOCUSED_THUNDER]
     if state.talents[TEA_OF_PLENTY]
       2.times do
-        state.empowered_rsks += 1 if $gen.rand > (1 / 3)
+        state.empowered_rsks += 1 if $gen.rand < (1 / 3)
       end
     end
   end
 end
 
 class Simulation
-  attr_reader :iterations
+  attr_reader :strategy, :iterations
 
-  def initialize
+  def initialize(strategy)
+    @strategy = strategy
     @iterations = []
   end
 
-  def run(num_targets, duration, iteration_count, strategy)
+  def run(num_targets, duration, iteration_count)
     @iterations = (0...iteration_count).map do
-      state = State.new(strategy.talents)
+      state = State.new(@strategy.talents)
 
       until state.time >= duration
-        ability = strategy.logic.find do |ability_, condition|
+        ability = @strategy.logic.find do |ability_, condition|
           state.off_cd?(ability_.name) &&
             (ability_.required_talent.nil? || state.talents[ability_.required_talent]) &&
             (condition.nil? || condition.call(state))
@@ -319,8 +365,12 @@ class Simulation
     @iterations.max_by(&:damage)
   end
 
-  def average_dps_of_best(n)
-    @iterations.max_by(n, &:damage).sum(&:dps) / [n, @iterations.size].min
+  def median_iteration
+    @iterations.sort_by(&:damage)[@iterations.size / 2]
+  end
+
+  def worst_iteration
+    @iterations.min_by(&:damage)
   end
 
   def average_dps
@@ -329,14 +379,13 @@ class Simulation
 end
 
 Strategy = Struct.new(:name, :talents, :logic)
-Result = Struct.new(:strategy, :best_iteration, :dps)
 
 tiger_palm = TigerPalm.new(name: 'Tiger Palm', ap_scaling: 0.27027, mw_modifier: 1)
 blackout_kick = BlackoutKick.new(name: 'Blackout Kick', ap_scaling: 0.847, mw_modifier: -0.15, cooldown: 3, haste_flagged: true)
 rsk = RisingSunKick.new(name: 'Rising Sun Kick', ap_scaling: 1.438, mw_modifier: 0.38, cooldown: 12, haste_flagged: true)
 sck = SpinningCraneKick.new(name: 'Spinning Crane Kick', ap_scaling: 0.1, mw_modifier: 1.35, max_targets: Float::INFINITY)
 zen_pulse = Ability.new(name: 'Zen Pulse', sp_scaling: 1.37816, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
-chi_burst = Ability.new(name: 'Chi Burst', sp_scaling: 0.46, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
+chi_burst = Ability.new(name: 'Chi Burst', ap_scaling: 0.46, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
 faeline_stomp = FaelineStomp.new(name: FAELINE_STOMP, ap_scaling: 0.4, cooldown: 30, max_targets: 5, physical_school: false)
 bdb = BonedustBrew.new(name: BONEDUST_BREW, cooldown: 60, gcd: 1, required_talent: BONEDUST_BREW)
 summon_white_tiger_statue = SummonWhiteTigerStatue.new(name: SUMMON_WHITE_TIGER_STATUE, cooldown: 120, gcd: 1, required_talent: SUMMON_WHITE_TIGER_STATUE)
@@ -365,15 +414,6 @@ st_infusion_prio = Strategy.new('STI', [], [
   blackout_kick,
 ])
 
-many_target = Strategy.new('MT', [], [
-  tft,
-  summon_white_tiger_statue,
-  invoke,
-  bdb,
-  zen_pulse,
-  sck,
-])
-
 mt_infusion_prio = Strategy.new('MTI', [], [
   tft,
   summon_white_tiger_statue,
@@ -393,8 +433,9 @@ target_strategies = {
 }
 
 default_talents = {
-  'Ferocity of Xuen' => true,
-  'Fast Feet' => true,
+  FEROCITY_OF_XUEN => true,
+  FAST_FEET => true,
+  RESONANT_FISTS => true,
   SUMMON_WHITE_TIGER_STATUE => true,
   TEACHINGS => true,
   GIFT_OF_THE_CELESTIALS => true,
@@ -407,7 +448,7 @@ default_talents = {
 }
 
 SECRET_INFUSION_2 = 'Secret Infusion 2'
-talents_to_test = [SECRET_INFUSION, SECRET_INFUSION_2, INVOKERS_DELIGHT, TEA_OF_PLENTY, FOCUSED_THUNDER, BONEDUST_BREW, ATTENUATION]
+talents_to_test = [SECRET_INFUSION, SECRET_INFUSION_2, INVOKERS_DELIGHT, FOCUSED_THUNDER, BONEDUST_BREW, ATTENUATION]
 talent_combos = talents_to_test.permutation(4).filter_map do |talents|
   next if talents.include?(ATTENUATION) && !talents.include?(BONEDUST_BREW)
   next if talents.include?(SECRET_INFUSION_2) && !talents.include?(SECRET_INFUSION)
@@ -419,7 +460,7 @@ talent_combos = talents_to_test.permutation(4).filter_map do |talents|
 end.uniq
 
 s = Time.new
-duration = 120
+duration = 55
 iterations = 100
 total_iter_count = 0
 seed = Random.new_seed
@@ -428,35 +469,35 @@ seed = Random.new_seed
   puts "#{num_targets} targets"
 
   strategies = target_strategies.fetch(num_targets)
-  results = strategies.flat_map do |base_strategy|
+  sims = strategies.flat_map do |base_strategy|
     talent_combos.map do |talents|
       strategy = Strategy.new(base_strategy.name, default_talents.merge(talents), base_strategy.logic)
 
       $gen = Random.new(seed)
-      sim = Simulation.new
-      sim.run(num_targets, duration, iterations, strategy)
+      sim = Simulation.new(strategy)
+      sim.run(num_targets, duration, iterations)
       total_iter_count += iterations
-      Result.new(strategy, sim.best_iteration, sim.average_dps)
+      sim
     end
   end
 
-  pretty_talents = ->(result) do
-    result.strategy.talents.filter_map do |talent, value|
+  pretty_talents = ->(sim) do
+    sim.strategy.talents.filter_map do |talent, value|
       next unless value && talents_to_test.include?(talent)
       talent + (value == true ? '' : " #{value}")
     end.join(' + ')
   end
 
-  results = results.sort_by(&:dps).reverse
-  results.each.with_index do |result, idx|
+  sims = sims.sort_by { _1.average_dps }.reverse
+  sims.each.with_index do |sim, idx|
     prefix = idx == 0 ? '>' : ' '
-    base_name = result.strategy.name.ljust(4)
-    talents = pretty_talents.call(result)
-    puts "#{prefix} #{base_name} | #{talents} | #{result.dps} dps"
+    base_name = sim.strategy.name.ljust(4)
+    talents = pretty_talents.call(sim)
+    puts "#{prefix} #{base_name} | #{talents} | #{sim.average_dps} dps (#{sim.worst_iteration.dps}-#{sim.best_iteration.dps})"
   end
 
-  # results.each { |result| puts; puts [result.strategy.name, pretty_talents.call(result)].join(' | '); result.best_iteration.print_stats }
-  # puts; results.first.best_iteration.print_stats
+  # sims.each { |sim| puts; puts [sim.strategy.name, pretty_talents.call(sim)].join(' | '); sim.median_iteration.print_stats }
+  puts; sims.first.median_iteration.print_stats(true)
   puts
 end
 
