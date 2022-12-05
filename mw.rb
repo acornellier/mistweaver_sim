@@ -14,22 +14,58 @@ ATTENUATION = 'Attenuation'
 TEA_OF_PLENTY = 'Tea of Plenty'
 FOCUSED_THUNDER = 'Focused Thunder'
 
+class Stats
+  attr_accessor :time, :cast_history, :damage, :total_weapon_damage, :total_white_tiger_damage
+
+  def initialize
+    @time = 0
+    @cast_history = []
+    @damage = 0
+    @total_weapon_damage = 0
+    @total_white_tiger_damage = 0
+  end
+
+  def dps
+    (@damage / @time).round
+  end
+
+  def print_stats
+    puts "Damage: #{@damage.round}"
+    puts "DPS: #{dps}"
+    puts damage_stats('Weapon', @total_weapon_damage.round, '?')
+    @cast_history.group_by { _1[0] }.each do |ability_name, casts|
+      ability_damage = casts.sum { _2 || 0 }.round
+      puts damage_stats(ability_name, ability_damage, casts.size) if ability_damage > 0
+    end
+    puts
+    # @state.cast_history.each do |h|
+    #   puts h.join(' - ')
+    # end
+  end
+
+  def damage_stats(name, damage, casts)
+    ability_percent = (damage / @damage * 100).round(1)
+    ability_dps = (damage / @time).round
+    "#{name}: #{ability_dps} dps (#{ability_percent}%), #{damage} dmg, #{casts} casts"
+  end
+end
+
 class State
-  attr_reader :talents, :base_versatility, :base_haste,
-              :time, :history, :damage, :total_weapon_damage, :total_white_tiger_damage
+  attr_reader :talents, :base_versatility, :base_haste, :base_attack_power, :base_spell_power, :base_weapon_dps,
+              :time, :stats
   attr_accessor :cooldowns, :buffs, :teachings, :first_tft_empower_available, :empowered_rsks
 
   def initialize(talents)
     @base_versatility = 0.0998
     @base_haste = 0.1182
     @base_critical_strike = 0.1508
+    @base_attack_power = 6764
+    @base_spell_power = 6504
+    @base_weapon_dps = 1582.24
     @talents = Hash.new(false).merge(talents)
 
     @time = 0
-    @history = []
-    @damage = 0
-    @total_weapon_damage = 0
-    @total_white_tiger_damage = 0
+    @stats = Stats.new
 
     @cooldowns = Hash.new(0)
     @buffs = Hash.new(0)
@@ -44,34 +80,23 @@ class State
 
     cooldowns[ability.name] = ability.hasted_cooldown(self)
 
-    damage = ability.cast(self, num_targets).round
+    damage = ability.damage(self, num_targets).round
     ability.side_effects(self, num_targets)
 
     gcd = ability.gcd / (1 + haste)
 
-    weapon_damage = weapon_dps * gcd * damage_multiplier
+    weapon_damage = @base_weapon_dps * gcd * damage_multiplier
     white_tiger_damage = white_tiger_dps(num_targets) * gcd * damage_multiplier
 
-    @total_weapon_damage += weapon_damage
-    @total_white_tiger_damage += white_tiger_damage
-    @damage += damage + weapon_damage + white_tiger_damage
-    @history << [ability.name, damage]
+    @stats.total_weapon_damage += weapon_damage
+    @stats.total_white_tiger_damage += white_tiger_damage
+    @stats.damage += damage + weapon_damage + white_tiger_damage
+    @stats.cast_history << [ability.name, damage]
 
     @cooldowns.transform_values! { _1 - gcd }
     @buffs.transform_values! { _1 - gcd }
     @time += gcd
-  end
-
-  def attack_power
-    6764
-  end
-
-  def spell_power
-    6504
-  end
-
-  def weapon_dps
-    1582.24
+    @stats.time = @time
   end
 
   def versatility
@@ -116,7 +141,7 @@ class State
     return 0 unless buff_active?(SUMMON_WHITE_TIGER_STATUE)
     attack_power_scaling = 0.25
     time_between_pulses = 2
-    attack_power_scaling * attack_power * num_targets / time_between_pulses
+    attack_power_scaling * @base_attack_power * num_targets / time_between_pulses
   end
 
   def secret_infusion_increase
@@ -142,8 +167,8 @@ class Ability
     @required_talent = required_talent
   end
 
-  def cast(state, num_targets)
-    base_damage = @ap_scaling * state.attack_power + @sp_scaling * state.spell_power
+  def damage(state, num_targets)
+    base_damage = @ap_scaling * state.base_attack_power + @sp_scaling * state.base_spell_power
     base_damage += base_damage * @mw_modifier
     targets_hit = [num_targets, @max_targets].min
     armor_reduction = @physical_school ? ARMOR_RESISTANCE : 1
@@ -159,7 +184,7 @@ class Ability
 end
 
 class TigerPalm < Ability
-  def cast(state, num_targets)
+  def damage(state, num_targets)
     super * (state.buff_active?(FAELINE_STOMP) ? 2 : 1)
   end
 
@@ -171,7 +196,7 @@ class TigerPalm < Ability
 end
 
 class BlackoutKick < Ability
-  def cast(state, num_targets)
+  def damage(state, num_targets)
     @max_targets = state.buff_active?(FAELINE_STOMP) ? 3 : 1
     super * (1 + state.teachings)
   end
@@ -191,7 +216,7 @@ class BlackoutKick < Ability
 end
 
 class RisingSunKick < Ability
-  def cast(state, num_targets)
+  def damage(state, num_targets)
     fast_feet_multiplier = state.talents['Fast Feet'] ? 1.7 : 1
     super * fast_feet_multiplier
   end
@@ -207,7 +232,7 @@ class RisingSunKick < Ability
 end
 
 class SpinningCraneKick < Ability
-  def cast(state, num_targets)
+  def damage(state, num_targets)
     fast_feet_multiplier = state.talents['Fast Feet'] ? 1.1 : 1
     base = super * fast_feet_multiplier
     base *= Math.sqrt(5.0 / num_targets) if num_targets > 5
@@ -254,67 +279,30 @@ class ThunderFocusTea < Ability
   end
 end
 
-class Iteration
-  def initialize(talents)
-    @state = State.new(talents)
-    @damage = 0
-    @history = []
-    @total_weapon_damage = 0
-    @time_elapsed = 0
-  end
-
-  def run(num_targets, duration, strategy)
-    until @state.time >= duration
-      ability = strategy.logic.find do |ability_, condition|
-        @state.off_cd?(ability_.name) &&
-          (ability_.required_talent.nil? || @state.talents[ability_.required_talent]) &&
-          (condition.nil? || condition.call(@state))
-      end
-      ability = ability.first if ability.is_a?(Array)
-      @state.cast_ability(ability, num_targets)
-    end
-  end
-
-  def damage
-    @state.damage
-  end
-
-  def dps
-    (@state.damage / @state.time).round
-  end
-
-  def print_stats
-    puts "Damage: #{@state.damage.round}"
-    puts "DPS: #{@state.dps}"
-    puts "Weapon: #{(@total_weapon_damage / @state.time).round} dps"
-    @state.history.group_by { _1[0] }.each do |ability_name, casts|
-      ability_dps = (casts.sum { _2 || 0 } / @state.time).round
-      puts "#{ability_name}: #{ability_dps} dps, #{casts.size} casts" if ability_dps > 0
-    end
-    puts
-    @state.history.each do |h|
-      puts h.join(' - ')
-    end
-  end
-end
-
 class Simulation
   attr_reader :iterations
 
-  def initialize(num_targets, duration, iteration_count, strategy)
-    @num_targets = num_targets
-    @duration = duration
-    @iteration_count = iteration_count
-    @strategy = strategy
+  def initialize
     @iterations = []
   end
 
-  def run
-    new_iterations = Array.new(@iteration_count) { Iteration.new(@strategy.talents) }
-    new_iterations.each do |iteration|
-      iteration.run(@num_targets, @duration, @strategy)
+  def run(num_targets, duration, iteration_count, strategy)
+    @iterations = (0...iteration_count).map do
+      state = State.new(strategy.talents)
+
+      until state.time >= duration
+        ability = strategy.logic.find do |ability_, condition|
+          state.off_cd?(ability_.name) &&
+            (ability_.required_talent.nil? || state.talents[ability_.required_talent]) &&
+            (condition.nil? || condition.call(state))
+        end
+
+        ability = ability.first if ability.is_a?(Array)
+        state.cast_ability(ability, num_targets)
+      end
+
+      state.stats
     end
-    @iterations += new_iterations
   end
 
   def best_iteration
@@ -322,7 +310,7 @@ class Simulation
   end
 
   def average_dps_of_best(n)
-    @iterations.max_by(n, &:dps).sum(&:dps) / [n, @iterations.size].min
+    @iterations.max_by(n, &:damage).sum(&:dps) / [n, @iterations.size].min
   end
 
   def average_dps
@@ -349,8 +337,8 @@ single_target = Strategy.new('ST', [], [
   tft,
   summon_white_tiger_statue,
   [faeline_stomp, -> { _1.buff_inactive?(FAELINE_STOMP) }],
-  invoke,
   bdb,
+  invoke,
   rsk,
   [tiger_palm, -> { _1.teachings <= 1 }],
   blackout_kick,
@@ -389,7 +377,7 @@ mt_infusion_prio = Strategy.new('MTI', [], [
 target_strategies = {
   1 => [single_target],
   2 => [single_target],
-  3 => [single_target, st_infusion_prio],
+  3 => [st_infusion_prio],
   4 => [mt_infusion_prio],
   5 => [mt_infusion_prio],
 }
@@ -426,7 +414,7 @@ iterations = 100
 total_iter_count = 0
 seed = Random.new_seed
 
-(1..5).each do |num_targets|
+(1..1).each do |num_targets|
   puts "#{num_targets} targets"
 
   strategies = target_strategies.fetch(num_targets)
@@ -435,8 +423,8 @@ seed = Random.new_seed
       strategy = Strategy.new(base_strategy.name, default_talents.merge(talents), base_strategy.logic)
 
       $gen = Random.new(seed)
-      sim = Simulation.new(num_targets, duration, iterations, strategy)
-      sim.run
+      sim = Simulation.new
+      sim.run(num_targets, duration, iterations, strategy)
       total_iter_count += iterations
       Result.new(strategy, sim.best_iteration, sim.average_dps)
     end
@@ -458,7 +446,7 @@ seed = Random.new_seed
   end
 
   # results.each { |result| puts; puts [result.strategy.name, pretty_talents.call(result)].join(' | '); result.best_iteration.print_stats }
-  # puts; results.first.best_iteration.print_stats
+  puts; results.first.best_iteration.print_stats
   puts
 end
 
