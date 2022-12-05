@@ -14,12 +14,12 @@ FOCUSED_THUNDER = 'Focused Thunder'
 
 class State
   attr_reader :talents, :base_versatility, :base_haste, :time
-  attr_accessor :cooldowns, :buffs, :teachings, :empowered_rsks
+  attr_accessor :cooldowns, :buffs, :teachings, :first_tft_empower_available, :empowered_rsks
 
   def initialize(talents)
-    @base_versatility = 0.1843
-    @base_haste = 0.1158
-    @base_critical_strike = 0.0725
+    @base_versatility = 0.0998
+    @base_haste = 0.1182
+    @base_critical_strike = 0.1508
     @talents = Hash.new(false).merge(talents)
 
     @time = 0
@@ -28,6 +28,7 @@ class State
     @faeline = false
     @teachings = 0
     @empowered_rsks = 0
+    @first_tft_empower_available = false
   end
 
   def attack_power
@@ -67,6 +68,10 @@ class State
     @buffs[buff_name] > 0
   end
 
+  def buff_inactive?(buff_name)
+    !buff_active?(buff_name)
+  end
+
   def tick_gcd(ability_gcd)
     gcd = ability_gcd / (1 + haste)
     @time += gcd
@@ -82,9 +87,10 @@ class State
 end
 
 class Ability
-  attr_reader :name, :gcd
+  attr_reader :name, :gcd, :required_talent
 
-  def initialize(name:, ap_scaling: 0, sp_scaling: 0, mw_modifier: 0, cooldown: 0, max_targets: 1, physical_school: true, haste_flagged: false, gcd: 1.5)
+  def initialize(name:, ap_scaling: 0, sp_scaling: 0, mw_modifier: 0, cooldown: 0, max_targets: 1,
+                 physical_school: true, haste_flagged: false, gcd: 1.5, required_talent: nil)
     @name = name
     @ap_scaling = ap_scaling
     @sp_scaling = sp_scaling
@@ -94,6 +100,7 @@ class Ability
     @physical_school = physical_school
     @haste_flagged = haste_flagged
     @gcd = gcd
+    @required_talent = required_talent
   end
 
   def cast(state, num_targets)
@@ -158,6 +165,7 @@ class RisingSunKick < Ability
   def side_effects(state, num_targets)
     return unless state.empowered_rsks > 0
     state.cooldowns[name] -= 9
+    state.first_tft_empower_available = false
     state.empowered_rsks -= 1
     state.cooldowns['Thunder Focus Tea'] = 30
     state.buffs[SECRET_INFUSION] = 10 if state.talents[SECRET_INFUSION]
@@ -194,7 +202,20 @@ class BonedustBrew < Ability
 end
 
 class SummonWhiteTigerStatue < Ability
+  def side_effects(state, num_targets) end
+end
 
+class ThunderFocusTea < Ability
+  def side_effects(state, num_targets)
+    state.first_tft_empower_available = true
+    state.empowered_rsks += 1
+    state.empowered_rsks += 1 if state.talents[FOCUSED_THUNDER]
+    if state.talents[TEA_OF_PLENTY]
+      2.times do
+        state.empowered_rsks += 1 if $gen.rand > (1 / 3)
+      end
+    end
+  end
 end
 
 class Iteration
@@ -210,26 +231,12 @@ class Iteration
 
   def run(num_targets, duration, strategy)
     until @state.time >= duration
-      if @state.cooldowns['Thunder Focus Tea'] <= 0
-        @state.empowered_rsks += 1
-        @state.empowered_rsks += 1 if @state.talents[FOCUSED_THUNDER]
-        if @state.talents[TEA_OF_PLENTY]
-          2.times do
-            @state.empowered_rsks += 1 if $gen.rand > 1 / 3
-          end
-        end
-
-        @state.cooldowns['Thunder Focus Tea'] = Float::INFINITY
-        @history << ['Thunder Focus Tea']
+      ability = strategy.logic.find do |ability_, condition|
+        @state.off_cd?(ability_.name) &&
+          (ability_.required_talent.nil? || @state.talents[ability_.required_talent]) &&
+          (condition.nil? || condition.call(@state))
       end
-
-      if strategy.logic.is_a?(Array)
-        ability = strategy.logic.find do |ability_, condition|
-          @state.off_cd?(ability_.name) && (!condition || condition.call(@state))
-        end.first
-      else
-        ability = strategy.logic.call(@state)
-      end
+      ability = ability.first if ability.is_a?(Array)
       throw "Chose ability on cooldown" if @state.on_cd?(ability.name)
 
       @state.cooldowns[ability.name] = ability.hasted_cooldown(@state)
@@ -255,7 +262,7 @@ class Iteration
   def print_stats
     puts "Damage: #{damage.round}"
     puts "DPS: #{dps}"
-    puts "Weapon: #{(@total_weapon_damage / @state.time).round}"
+    puts "Weapon: #{(@total_weapon_damage / @state.time).round} dps"
     @history.group_by { _1[0] }.each do |ability_name, casts|
       ability_dps = (casts.sum { _2 || 0 } / @state.time).round
       puts "#{ability_name}: #{ability_dps} dps, #{casts.size} casts" if ability_dps > 0
@@ -309,54 +316,53 @@ sck = SpinningCraneKick.new(name: 'Spinning Crane Kick', ap_scaling: 0.4, mw_mod
 zen_pulse = Ability.new(name: 'Zen Pulse', sp_scaling: 1.37816, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
 chi_burst = Ability.new(name: 'Chi Burst', sp_scaling: 0.46, cooldown: 30, max_targets: Float::INFINITY, physical_school: false)
 faeline_stomp = FaelineStomp.new(name: FAELINE_STOMP, ap_scaling: 0.4, cooldown: 30, max_targets: 5, physical_school: false)
-bdb = BonedustBrew.new(name: BONEDUST_BREW, cooldown: 60, gcd: 1)
-summon_white_tiger_statue = SummonWhiteTigerStatue.new(name: SUMMON_WHITE_TIGER_STATUE, ap_scaling: 0.25, cooldown: 120, gcd: 1)
-invoke = Invoke.new(name: 'Invoke', cooldown: 180)
+bdb = BonedustBrew.new(name: BONEDUST_BREW, cooldown: 60, gcd: 1, required_talent: BONEDUST_BREW)
+summon_white_tiger_statue = SummonWhiteTigerStatue.new(name: SUMMON_WHITE_TIGER_STATUE, ap_scaling: 0.25, cooldown: 120, gcd: 1, required_talent: SUMMON_WHITE_TIGER_STATUE)
+invoke = Invoke.new(name: 'Invoke', cooldown: 180, gcd: 1, required_talent: INVOKERS_DELIGHT)
+tft = ThunderFocusTea.new(name: 'Thunder Focus Tea', cooldown: 30, gcd: 0)
 
 single_target = Strategy.new('ST', [], [
-  [faeline_stomp, -> { _1.buff_active?(FAELINE_STOMP) }],
-  [invoke, -> { _1.off_cd?(invoke.name) && _1.talents[INVOKERS_DELIGHT] }],
-  [bdb, -> { _1.off_cd?(bdb.name) && _1.talents[BONEDUST_BREW] }],
-  [rsk, -> { _1.off_cd?(rsk.name) }],
+  tft,
+  [faeline_stomp, -> { _1.buff_inactive?(FAELINE_STOMP) }],
+  invoke,
+  bdb,
+  rsk,
   [tiger_palm, -> { _1.teachings <= 1 }],
-  [blackout_kick],
+  blackout_kick,
 ])
 
 st_infusion_prio = Strategy.new('STI', [], [
-  [faeline_stomp, -> { _1.buff_active?(FAELINE_STOMP) }],
-  [invoke, -> { _1.off_cd?(invoke.name) && _1.talents[INVOKERS_DELIGHT] }],
-  [bdb, -> { _1.off_cd?(bdb.name) && _1.talents[BONEDUST_BREW] }],
-  [rsk, -> { _1.empowered_rsks > 0 && _1.talents[SECRET_INFUSION] }],
+  tft,
+  [faeline_stomp, -> { _1.buff_inactive?(FAELINE_STOMP) }],
+  invoke,
+  bdb,
+  [rsk, -> { _1.first_tft_empower_available && _1.talents[SECRET_INFUSION] }],
   [tiger_palm, -> { _1.teachings <= 1 }],
-  [blackout_kick],
+  blackout_kick,
 ])
 
 many_target = Strategy.new('MT', [], [
-  [summon_white_tiger_statue, -> { _1.talents[SUMMON_WHITE_TIGER_STATUE] }],
-  [invoke, -> { _1.talents[INVOKERS_DELIGHT] }],
-  [bdb, -> { _1.talents[BONEDUST_BREW] }],
-  [zen_pulse],
-  [sck],
-])
-mt_infusion_prio = Strategy.new('MTI', [], [
-  [summon_white_tiger_statue, -> { _1.talents[SUMMON_WHITE_TIGER_STATUE] }],
-  [invoke, -> { _1.talents[INVOKERS_DELIGHT] }],
-  [bdb, -> { _1.talents[BONEDUST_BREW] }],
-  [rsk, -> { _1.empowered_rsks > 0 && _1.talents[SECRET_INFUSION] }],
-  [zen_pulse],
-  [sck],
+  tft,
+  summon_white_tiger_statue,
+  invoke,
+  bdb,
+  zen_pulse,
+  sck,
 ])
 
-all_random = Strategy.new('All random', [], ->(state) do
-  [blackout_kick, rsk, sck].select { state.off_cd?(_1.name) }.sample
-end)
-no_sck_random = Strategy.new('RSK random', [], ->(state) do
-  [tiger_palm, blackout_kick, rsk].select { state.off_cd?(_1.name) }.sample
-end)
+mt_infusion_prio = Strategy.new('MTI', [], [
+  tft,
+  summon_white_tiger_statue,
+  invoke,
+  bdb,
+  [rsk, -> { _1.first_tft_empower_available && _1.talents[SECRET_INFUSION] }],
+  zen_pulse,
+  sck,
+])
 
 target_strategies = {
   1 => [single_target],
-  2 => [single_target, st_infusion_prio],
+  2 => [single_target],
   3 => [single_target, st_infusion_prio],
   4 => [mt_infusion_prio],
   5 => [mt_infusion_prio],
@@ -365,7 +371,7 @@ target_strategies = {
 default_talents = {
   'Ferocity of Xuen' => true,
   'Fast Feet' => true,
-  SUMMON_WHITE_TIGER_STATUE => true,
+  SUMMON_WHITE_TIGER_STATUE => false,
   TEACHINGS => true,
   GIFT_OF_THE_CELESTIALS => true,
   TEA_OF_PLENTY => false,
@@ -377,7 +383,7 @@ default_talents = {
 }
 
 SECRET_INFUSION_2 = 'Secret Infusion 2'
-talents_to_test = [TEA_OF_PLENTY, SECRET_INFUSION, SECRET_INFUSION_2, INVOKERS_DELIGHT, FOCUSED_THUNDER, BONEDUST_BREW, ATTENUATION]
+talents_to_test = [SECRET_INFUSION, SECRET_INFUSION_2, INVOKERS_DELIGHT, TEA_OF_PLENTY, FOCUSED_THUNDER, BONEDUST_BREW, ATTENUATION]
 talent_combos = talents_to_test.permutation(4).filter_map do |talents|
   next if talents.include?(ATTENUATION) && !talents.include?(BONEDUST_BREW)
   next if talents.include?(SECRET_INFUSION_2) && !talents.include?(SECRET_INFUSION)
@@ -389,7 +395,7 @@ talent_combos = talents_to_test.permutation(4).filter_map do |talents|
 end.uniq
 
 s = Time.new
-duration = 60
+duration = 30
 iterations = 100
 total_iter_count = 0
 seed = Random.new_seed
@@ -400,7 +406,7 @@ seed = Random.new_seed
   strategies = target_strategies.fetch(num_targets)
   results = strategies.flat_map do |base_strategy|
     talent_combos.map do |talents|
-      strategy = Strategy.new(base_strategy.name, talents, base_strategy.logic)
+      strategy = Strategy.new(base_strategy.name, default_talents.merge(talents), base_strategy.logic)
 
       $gen = Random.new(seed)
       sim = Simulation.new(num_targets, duration, iterations, strategy)
@@ -410,24 +416,23 @@ seed = Random.new_seed
     end
   end
 
+  pretty_talents = ->(result) do
+    result.strategy.talents.filter_map do |talent, value|
+      next unless value && talents_to_test.include?(talent)
+      talent + (value == true ? '' : " #{value}")
+    end.join(' + ')
+  end
+
   results = results.sort_by(&:dps).reverse
   results.each.with_index do |result, idx|
     prefix = idx == 0 ? '>' : ' '
     base_name = result.strategy.name.ljust(4)
-    talents = result.strategy.talents.filter_map do |talent, value|
-      next unless value && talents_to_test.include?(talent)
-      talent + (value == true ? '' : " #{value}")
-    end.join(' + ')
+    talents = pretty_talents.call(result)
     puts "#{prefix} #{base_name} | #{talents} | #{result.dps} dps"
   end
 
-  # results.each do |result|
-  #   puts
-  #   puts result.strategy.name
-  #   result.best_iteration.print_stats
-  # end
-  # puts
-  # results.first.best_iteration.print_stats
+  # results.each { |result| puts; puts [result.strategy.name, pretty_talents.call(result)].join(' | '); result.best_iteration.print_stats }
+  # puts; results.first.best_iteration.print_stats
   puts
 end
 
